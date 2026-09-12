@@ -1513,12 +1513,14 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
     # Find the browser content root in UIA. It provides an approximate transform from
     # DOM viewport coordinates to screen coordinates without asking GPT to reconcile systems.
     doc_candidates=[]
+    uia_page_available=False
     for e in uels if isinstance(uels,list) else []:
         if not isinstance(e,dict):continue
         role=_norm_role(str(e.get("role") or ""))
         b=_bounds(e)
         if role in {"document","region"} and b and b["width"]>300 and b["height"]>200:
-            score=b["width"]*b["height"]
+            if role=="document": uia_page_available=True
+            score=b["width"]*b["height"]*(10 if role=="document" else 1)
             nm=_norm_name(str(e.get("name") or ""))
             if nm and nm in _norm_name(str(row["active_tab"] or row["window_title"])):score*=1.5
             doc_candidates.append((score,b,e))
@@ -1610,7 +1612,9 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
             objects.append({"object_id":object_id,"stable_id":stable_id,"state_hash":state_hash,"role":u["role"],"name":u["name"],"value":clip_text(raw.get("value") or "",300),"sources":["uia"],"confidence":0.84,"focused":bool(focus_name and focus_name==u["norm"]),"enabled":bool(raw.get("enabled",True)),"bounds":{"viewport":None,"screen_estimate":None,"screen":u["bounds"]},"dom":{"selector":"","href":"","id":"","tag":""},"uia":{"automation_id":automation_id,"role":u["role"]}})
             if len(objects)>=max_objects:break
     fused=sum(1 for o in objects if len(o["sources"])>1)
-    return {"frame_id":row["id"],"timestamp":now_iso(float(row["ts"])),"world_state":{"app":row["app"],"window_title":row["window_title"],"url":row["url"],"active_tab":row["active_tab"],"surface":row["surface"],"focus":browser_focus or load_json(row["focus_json"],{}),"cursor":load_json(row["cursor_json"],{}),"viewport":viewport},"source_quality":{"dom_available":bool(dcontrols),"uia_available":bool(uels),"screenshot_available":frame_has_image(row),"browser_bridge_snapshot_id":snapshot_id or None,"document_screen_bounds":doc_bounds,"coordinate_calibration":{"scale":round(scale,4),"dpr":dpr,"content_origin":content_origin,"scroll":{"x":viewport.get("x",0),"y":viewport.get("y",0)}}},"regions":{"headings":headings[:80] if isinstance(headings,list) else [],"landmarks":landmarks[:60] if isinstance(landmarks,list) else []},"objects":objects,"stats":{"objects":len(objects),"fused_dom_uia":fused,"dom_only":sum(1 for o in objects if o["sources"]==["dom"]),"uia_only":sum(1 for o in objects if o["sources"]==["uia"])}}
+    fusion_status=("fused" if fused else "no_dom" if not dcontrols else "no_uia" if not uels else
+                   "no_comparable_uia_page_objects" if not uia_page_available else "no_confident_match")
+    return {"frame_id":row["id"],"timestamp":now_iso(float(row["ts"])),"world_state":{"app":row["app"],"window_title":row["window_title"],"url":row["url"],"active_tab":row["active_tab"],"surface":row["surface"],"focus":browser_focus or load_json(row["focus_json"],{}),"cursor":load_json(row["cursor_json"],{}),"viewport":viewport},"source_quality":{"dom_available":bool(dcontrols),"uia_available":bool(uels),"uia_page_available":uia_page_available,"screenshot_available":frame_has_image(row),"browser_bridge_snapshot_id":snapshot_id or None,"document_screen_bounds":doc_bounds,"coordinate_calibration":{"scale":round(scale,4),"dpr":dpr,"content_origin":content_origin,"scroll":{"x":viewport.get("x",0),"y":viewport.get("y",0)}}},"regions":{"headings":headings[:80] if isinstance(headings,list) else [],"landmarks":landmarks[:60] if isinstance(landmarks,list) else []},"objects":objects,"stats":{"objects":len(objects),"fused_dom_uia":fused,"dom_only":sum(1 for o in objects if o["sources"]==["dom"]),"uia_only":sum(1 for o in objects if o["sources"]==["uia"]),"fusion_status":fusion_status}}
 
 def auth_source(request: Request) -> sqlite3.Row | None:
     auth = request.headers.get("authorization", "")
