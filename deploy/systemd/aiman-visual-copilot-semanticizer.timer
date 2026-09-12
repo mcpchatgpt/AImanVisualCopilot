@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AVC Timeline Semanticizer periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=20s
+Persistent=true
+Unit=aiman-visual-copilot-semanticizer.service
+
+[Install]
+WantedBy=timers.target
