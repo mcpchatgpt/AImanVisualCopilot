@@ -75,7 +75,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const p = msg.payload || {};
       p.tab_id = sender.tab.id; p.window_id = sender.tab.windowId; p.active = true;
       p.extension_version = C.version; p.timestamp_unix = Date.now()/1000;
-      const key = sender.tab.id + ':' + (p.semantic_hash || '') + ':' + JSON.stringify(p.viewport || {});
+      const inputKey = (p.input_events || []).map(x=>[x.kind,x.key,x.timestamp_unix]).flat().join(':');
+      const key = sender.tab.id + ':' + (p.semantic_hash || '') + ':' + JSON.stringify(p.viewport || {}) + ':' + inputKey;
       const prev = lastSent.get(sender.tab.id); const now = Date.now();
       if (prev && prev.key === key && now - prev.at < 8000) { sendResponse({ok:true, skipped:'dedup'}); return; }
       try {

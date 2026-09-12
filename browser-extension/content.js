@@ -2,6 +2,7 @@
   if (window.__avcBridgeLoaded) return;
   window.__avcBridgeLoaded = true;
   let revision = 1, lastBuiltRevision = 0, lastBuiltAt = 0, tracking = false, observer = null;
+  let recentInputs = [];
   let lastBump = 0;
   const bump = () => { const n=Date.now(); if(n-lastBump>180){revision++;lastBump=n;} };
   const events = [['scroll',bump,{passive:true}],['resize',bump,{passive:true}],['focusin',bump,true],['popstate',bump,true],['hashchange',bump,true]];
@@ -43,17 +44,42 @@
       checked:'checked' in el?!!el.checked:undefined,selected:el.getAttribute?.('aria-selected')||'',expanded:el.getAttribute?.('aria-expanded')||'',
       x:r?Math.round(r.x):0,y:r?Math.round(r.y):0,width:r?Math.round(r.width):0,height:r?Math.round(r.height):0};
   }
+  function recordInput(ev){
+    if(!tracking) return;
+    try{
+      const raw=ev.target?.closest?.('a,button,input,select,textarea,[role],[contenteditable="true"]')||ev.target;
+      const target=raw&&raw.nodeType===1?elementInfo(raw):{};
+      let kind=ev.type;
+      let key='';
+      if(ev.type==='keydown'){
+        kind='key';
+        const named=['Enter','Escape','Tab','Backspace','Delete','ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '];
+        key=named.includes(ev.key)?ev.key:(ev.key?.length===1?'character':'other');
+      } else if(ev.type==='pointerdown') kind='pointer';
+      else if(ev.type==='click') kind='click';
+      else if(ev.type==='submit') kind='submit';
+      recentInputs.push({kind,key,button:Number.isInteger(ev.button)?ev.button:undefined,
+        x:Number.isFinite(ev.clientX)?Math.round(ev.clientX):undefined,y:Number.isFinite(ev.clientY)?Math.round(ev.clientY):undefined,
+        target:{role:target.role||target.tag||'',name:target.name||'',selector:target.selector||'',id:target.id||''},
+        timestamp_unix:Date.now()/1000});
+      recentInputs=recentInputs.slice(-20); bump();
+    }catch(_){}
+  }
+  for(const name of ['pointerdown','click','keydown','submit']) addEventListener(name,recordInput,true);
   function hash32(s){let h=2166136261>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return('00000000'+(h>>>0).toString(16)).slice(-8)}
   function build(){
     const bodyText=clean(document.body?.innerText||'',30000);
     const headings=[...document.querySelectorAll('h1,h2,h3,[role="heading"]')].filter(visible).slice(0,80).map(e=>({level:e.tagName?.match(/^H([1-6])$/)?.[1]||e.getAttribute('aria-level')||'',text:clean(e.innerText||e.textContent,500)}));
     const controls=[...document.querySelectorAll('a,button,input,select,textarea,[role="button"],[role="link"],[role="tab"],[role="checkbox"],[role="radio"],[role="menuitem"],[contenteditable="true"]')].filter(visible).slice(0,180).map(elementInfo);
-    const landmarks=[...document.querySelectorAll('main,nav,header,footer,aside,[role="main"],[role="navigation"],[role="dialog"],[role="alert"]')].filter(visible).slice(0,60).map(e=>({tag:(e.tagName||'').toLowerCase(),role:clean(e.getAttribute('role')||'',80),name:clean(e.getAttribute('aria-label')||e.getAttribute('title')||'',300)}));
+    const landmarks=[...document.querySelectorAll('main,nav,header,footer,aside,[role="main"],[role="navigation"],[role="dialog"],[role="alert"],[role="alertdialog"]')].filter(visible).slice(0,60).map(e=>{const role=clean(e.getAttribute('role')||'',80);return {tag:(e.tagName||'').toLowerCase(),role,name:clean(e.getAttribute('aria-label')||e.getAttribute('title')||(/alert|dialog/.test(role)?e.innerText||e.textContent:'')||'',300)}});
     const ae=document.activeElement,focus=ae&&ae!==document.body?elementInfo(ae):{};
-    const viewport={x:Math.round(scrollX),y:Math.round(scrollY),width:innerWidth,height:innerHeight,document_width:document.documentElement?.scrollWidth||0,document_height:document.documentElement?.scrollHeight||0,device_pixel_ratio:devicePixelRatio||1};
+    const viewport={x:Math.round(scrollX),y:Math.round(scrollY),width:innerWidth,height:innerHeight,document_width:document.documentElement?.scrollWidth||0,document_height:document.documentElement?.scrollHeight||0,device_pixel_ratio:devicePixelRatio||1,
+      screen_x:Math.round(screenX||0),screen_y:Math.round(screenY||0),outer_width:outerWidth||0,outer_height:outerHeight||0,
+      screen_width:screen?.width||0,screen_height:screen?.height||0};
     const dom={headings,controls,landmarks,language:document.documentElement?.lang||'',content_type:document.contentType||''};
     const sig=[location.href,document.title,bodyText.slice(0,12000),JSON.stringify(headings),JSON.stringify(controls.slice(0,80)),JSON.stringify(viewport)].join('\n');
-    return {url:location.href,title:document.title,visible_text:bodyText,dom,focus,viewport,revision,semantic_hash:hash32(sig),page_visibility:document.visibilityState};
+    const input_events=recentInputs.splice(0,recentInputs.length);
+    return {url:location.href,title:document.title,visible_text:bodyText,dom,focus,viewport,input_events,revision,semantic_hash:hash32(sig),page_visibility:document.visibilityState};
   }
   const isDevLocation=()=>{try{const h=location.hostname.toLowerCase(),p=Number(location.port||0);return h==='localhost'||h==='127.0.0.1'||h==='0.0.0.0'||h==='::1'||h.startsWith('10.')||h.startsWith('192.168.')||/^172\.(1[6-9]|2\d|3[01])\./.test(h)||h.endsWith('.local')||h.endsWith('.test')||[3000,3001,4000,4173,5000,5173,5174,8000,8080,8081,8888].includes(p)}catch(_){return false}};
   let devPerfSent=false;

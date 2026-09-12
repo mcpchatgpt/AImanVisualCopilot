@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AImanVisualCopilot (AVC) v0.2.0.
+"""AImanVisualCopilot (AVC) v0.9.0.
 
 A read-only MCP observation layer for Windows. AVC ingests semantic frames from a
 Windows observer and exposes compact, continuous UI context to AI clients.
@@ -33,7 +33,10 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-VERSION = "0.8.0"
+import migrations
+import state_engine
+
+VERSION = "0.9.0"
 SERVICE = "AImanVisualCopilot"
 MCP_TOKEN = os.environ.get("AVC_MCP_TOKEN", "")
 BOOTSTRAP_TOKEN = os.environ.get("AVC_BOOTSTRAP_TOKEN", "")
@@ -112,6 +115,8 @@ def load_json(raw: str | None, default: Any) -> Any:
 def db():
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     # Apply the physical SQLite guard on every AVC connection. max_page_count is
     # connection-scoped on the SQLite build used by this host, so startup-only is
     # not sufficient for a hard database ceiling.
@@ -132,6 +137,7 @@ def db():
 
 def init_db() -> None:
     with db() as conn:
+        migrations.preflight_legacy_schema(conn)
         conn.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
@@ -395,9 +401,21 @@ def init_db() -> None:
         conn.execute(f"PRAGMA max_page_count={max_pages}")
         conn.execute("PRAGMA wal_autocheckpoint=1000")
         conn.execute(f"PRAGMA journal_size_limit={8 * 1024 * 1024}")
+        migrations.apply_migrations(conn)
 
 
 init_db()
+
+
+def initialize_incremental_state() -> None:
+    """Seed the v0.9 current state without rewriting legacy semantic history."""
+    with db() as conn:
+        source_ids = [r[0] for r in conn.execute("SELECT id FROM sources")]
+        for source_id in source_ids:
+            state_engine.initialize_latest(conn, source_id)
+
+
+initialize_incremental_state()
 
 
 def _path_size(path: Path) -> int:
@@ -1133,27 +1151,46 @@ def _focus_label(row: sqlite3.Row) -> str:
 
 def _anomaly_from_frame(row: sqlite3.Row) -> tuple[bool,str,str]:
     title=str(row["window_title"] or "")
+    title_low=title.lower()
     app=str(row["app"] or "").lower()
-    f=load_json(row["focus_json"], {})
-    focus_hint=(str(f.get("name") or "")+" "+str(f.get("automation_id") or "")).lower()
-    conversational=any(x in title.lower() for x in ("chatgpt","feishu","slack","teams","discord")) or "chatgpt" in focus_hint or "prompt-textarea" in focus_hint
-    visible="" if conversational else str(row["visible_text"] or "")[:1600]
-    ime_candidate="candidatewindow" in visible.lower() or "转换候选项列表" in visible
-    if ime_candidate: visible=""
-    text=" ".join([title,str(row["summary"] or ""),visible]).lower()
-    critical=["exception","fatal error","application error","crashed","崩溃","致命错误"]
-    high=["connection failed","failed to connect","not responding","timeout","timed out","http 500","502 bad gateway","503 service unavailable","offline","连接失败","超时","无响应"]
-    medium=["error","failed","failure","not found","404","denied","invalid","错误","失败","未找到","拒绝"]
-    for terms,sev in ((critical,"critical"),(high,"high"),(medium,"medium")):
-        for x in terms:
-            if x in text:
-                return True,sev,x
+    changes=load_json(row["changes_json"], [])
+    events=load_json(row["events_json"], [])
+    # 0.9 only promotes structured failure evidence. Ordinary page/chat/document text
+    # is never treated as an error merely because it contains words such as "失败".
+    explicit={
+        "app_crash":"critical", "fatal_error":"critical", "error_dialog":"high",
+        "not_responding":"high", "connection_failed":"high", "timeout":"high",
+        "http_error":"medium", "network_error":"high", "resource_failed":"medium",
+        "permission_denied":"medium",
+    }
+    for item in list(changes or []) + list(events or []):
+        if not isinstance(item,dict):
+            continue
+        typ=str(item.get("type") or "").lower()
+        if typ in explicit:
+            return True,explicit[typ],typ
+        severity=str(item.get("severity") or "").lower()
+        if item.get("anomaly") and severity in {"medium","high","critical"}:
+            return True,severity,typ or "structured_anomaly"
+    # Windows itself marks a hung application in the window caption. This is a
+    # system signal, not an interpretation of document content.
+    if "not responding" in title_low or "未响应" in title:
+        return True,"high","not_responding"
+    # A real alert/dialog landmark plus failure semantics is acceptable evidence.
+    dom=load_json(row["dom_json"], {})
+    landmarks=dom.get("landmarks",[]) if isinstance(dom,dict) else []
+    for landmark in landmarks if isinstance(landmarks,list) else []:
+        if not isinstance(landmark,dict) or str(landmark.get("role") or "").lower() not in {"alert","alertdialog","dialog"}:
+            continue
+        label=(str(landmark.get("name") or "")+" "+title).lower()
+        for term,sev in (("fatal","critical"),("crash","critical"),("exception","critical"),("error","high"),("failed","high"),("错误","high"),("失败","high")):
+            if term in label:
+                return True,sev,"dialog_"+term
     # Low-information/blank-like visual state: screenshot exists but almost no semantic text.
     meta=load_json(row["metadata_json"], {})
-    dom=load_json(row["dom_json"], {})
     has_bridge=bool(meta.get("browser_bridge"))
     dom_has_content=bool((dom.get("controls") if isinstance(dom,dict) else None) or (dom.get("headings") if isinstance(dom,dict) else None))
-    if row["screenshot_path"] and has_bridge and not conversational and len(str(row["visible_text"] or "").strip()) < 8 and not dom_has_content and app in {"chrome","msedge","firefox","brave","opera"}:
+    if row["screenshot_path"] and has_bridge and len(str(row["visible_text"] or "").strip()) < 8 and not dom_has_content and app in {"chrome","msedge","firefox","brave","opera"}:
         return True,"low","browser_low_information_frame"
     return False,"",""
 
@@ -1177,14 +1214,7 @@ def _human_event(row: sqlite3.Row, previous: sqlite3.Row | None = None) -> list[
     if "active_tab_changed" in types:
         c=by_type["active_tab_changed"]; target=c.get("to") or row["active_tab"]
         add("tab_switch",f"用户切换到浏览器标签「{clip_text(target,180)}」",0.94,c)
-    strong_visual="significant_visual_change" in types or "browser_dom_changed" in types
-    if "focus_changed" in types and strong_visual:
-        latency=None
-        if previous is not None:
-            latency=max(0,int((float(row["ts"])-float(previous["ts"]))*1000))
-        label=focus or "当前控件"
-        add("interaction_result",f"用户将焦点移到「{label}」后，界面发生明显变化",0.76,{"focus":focus,"latency_ms":latency,"causal_hint":True})
-    elif "focus_changed" in types and focus:
+    if "focus_changed" in types and focus:
         # Focus-only churn is useful at raw Frame level but too noisy for semantic memory.
         pass
     if "dialog_opened" in types:
@@ -1227,63 +1257,43 @@ def _episode_title(events: list[dict[str,Any]]) -> str:
 
 def rebuild_causal_links(source_id: str, hours: int = 6) -> int:
     hours=max(1,min(int(hours),72)); cutoff=now_ts()-hours*3600; now=now_ts()
+    # 0.9 causality requires an explicit observed input. Focus proximity alone is no
+    # longer accepted because focus can change without a click or key press.
     with db() as conn:
-        frames=conn.execute("SELECT * FROM frames WHERE source_id=? AND ts>=? ORDER BY ts ASC",(source_id,cutoff)).fetchall()
-    links=[]; priority=["url_changed","active_tab_changed","window_changed","dialog_opened","dialog_closed","browser_dom_changed","significant_visual_change"]
-    for i,row in enumerate(frames):
-        changes=load_json(row["changes_json"],[]); typed={str(x.get("type") or ""):x for x in changes if isinstance(x,dict)}
-        effect=next((t for t in priority if t in typed),None)
-        if not effect: continue
-        candidates=[]
-        for j in range(max(0,i-3),i+1):
-            r=frames[j]
-            if float(row["ts"])-float(r["ts"])>3.5: continue
-            label=_focus_label(r)
-            if label: candidates.append((j,r,label))
-        if not candidates: continue
-        j,cause,label=candidates[-1]; latency=max(0,int((float(row["ts"])-float(cause["ts"]))*1000))
-        if j==i and i>0: latency=max(0,int((float(row["ts"])-float(frames[i-1]["ts"]))*1000))
-        if latency > 3500: continue
-        cf=load_json(cause["focus_json"], {})
-        cause_role=_norm_role(str(cf.get("role") or cf.get("tag") or ""))
-        if cause_role=="textbox" and effect in {"significant_visual_change","browser_dom_changed"}: continue
-        detail=typed.get(effect,{})
-        if effect=="url_changed": summary=f"界面导航到 {clip_text(detail.get('to') or row['url'],220)}"
-        elif effect=="window_changed": summary=f"窗口变为「{clip_text(detail.get('to') or row['window_title'],180)}」"
-        elif effect=="active_tab_changed": summary=f"标签页变为「{clip_text(detail.get('to') or row['active_tab'],180)}」"
-        elif effect.startswith("dialog_"): summary="弹窗状态发生变化"
-        elif effect=="browser_dom_changed": summary="网页结构发生变化"
-        else: summary="界面发生明显视觉变化"
-        conf=0.82 if effect in {"url_changed","active_tab_changed","window_changed","dialog_opened","dialog_closed"} else 0.68
-        cid="cause_"+sha256_text(f"{source_id}:{cause['id']}:{row['id']}:{effect}:{label}")[:24]
-        links.append((cid,source_id,cause["id"],row["id"],float(cause["ts"]),float(row["ts"]),"focus_or_interaction",label,effect,summary,latency,conf,safe_json({"effect_change":detail},16000),now))
-
-    # Dev diagnostics can be an effect of a recent UI interaction/navigation.
-    with db() as conn:
+        inputs=conn.execute("SELECT * FROM interaction_events WHERE source_id=? AND ts>=? ORDER BY ts ASC",(source_id,cutoff)).fetchall()
+        effects=conn.execute("""SELECT * FROM timeline_events WHERE source_id=? AND ts>=? AND event_type IN
+          ('url_changed','browser_url_changed','active_tab_changed','window_changed','dialog_opened','dialog_closed','browser_dom_changed','significant_visual_change')
+          ORDER BY ts ASC""",(source_id,cutoff)).fetchall()
         dev_rows=conn.execute("SELECT * FROM dev_events WHERE source_id=? AND ts>=? AND severity IN ('medium','high','critical') ORDER BY ts ASC",(source_id,cutoff)).fetchall()
+    links=[]
+    def nearest_input(effect_ts: float, max_seconds: float = 5.0):
+        candidates=[i for i in inputs if 0 <= effect_ts-float(i["ts"]) <= max_seconds]
+        return max(candidates,key=lambda x:float(x["ts"])) if candidates else None
+    for effect in effects:
+        cause=nearest_input(float(effect["ts"]),5.0)
+        if not cause: continue
+        latency=max(0,int((float(effect["ts"])-float(cause["ts"]))*1000))
+        kind=str(cause["kind"] or "input"); etype=str(effect["event_type"] or "change")
+        label=str(cause["target_name"] or cause["key_name"] or cause["target_role"] or kind)
+        detail=load_json(effect["detail_json"],{})
+        direct_nav=etype in {"url_changed","browser_url_changed","active_tab_changed"}
+        confidence=0.97 if direct_nav and kind in {"click","submit"} else 0.95 if direct_nav and cause["key_name"]=="Enter" else 0.86 if kind in {"click","submit","key"} else 0.76
+        summary=(f"界面导航到 {clip_text(detail.get('to') or effect['url'],220)}" if direct_nav else
+                 f"输入事件后发生 {etype}")
+        cid="cause_"+sha256_text(f"{source_id}:{cause['id']}:{effect['id']}:{etype}")[:24]
+        links.append((cid,source_id,cause["frame_id"],effect["frame_id"],float(cause["ts"]),float(effect["ts"]),
+                      "observed_"+kind,label,etype,summary,latency,confidence,
+                      safe_json({"interaction_id":cause["id"],"selector":cause["selector"],"key":cause["key_name"],"effect_change":detail},16000),now))
     for d in dev_rows:
-        candidates=[]
-        for r in reversed(frames):
-            delta=float(d["ts"])-float(r["ts"])
-            if delta < 0:
-                continue
-            if delta > 5.0:
-                break
-            label=_focus_label(r)
-            if label:
-                candidates.append((r,label,delta))
-        if not candidates:
-            continue
-        cause,label,delta=min(candidates,key=lambda x:x[2])
-        cf=load_json(cause["focus_json"],{})
-        role=_norm_role(str(cf.get("role") or cf.get("tag") or ""))
-        if role=="textbox" and str(d["event_type"]) in {"js_error","unhandled_rejection"}:
-            continue
-        latency=int(delta*1000)
-        conf=0.90 if role in {"button","link","menuitem","tab","checkbox","radio"} and latency<=2500 else 0.74
+        cause=nearest_input(float(d["ts"]),5.0)
+        if not cause: continue
+        latency=max(0,int((float(d["ts"])-float(cause["ts"]))*1000)); kind=str(cause["kind"] or "input")
+        label=str(cause["target_name"] or cause["key_name"] or cause["target_role"] or kind)
         effect="dev_"+str(d["event_type"] or "event")
-        cid="cause_"+sha256_text(f"dev:{source_id}:{cause['id']}:{d['id']}:{label}")[:24]
-        links.append((cid,source_id,cause["id"],"",float(cause["ts"]),float(d["ts"]),"focus_or_interaction",label,effect,clip_text(d["summary"],500),latency,conf,safe_json({"dev_event_id":d["id"],"severity":d["severity"],"detail":load_json(d["detail_json"],{})},16000),now))
+        cid="cause_"+sha256_text(f"dev:{source_id}:{cause['id']}:{d['id']}")[:24]
+        links.append((cid,source_id,cause["frame_id"],"",float(cause["ts"]),float(d["ts"]),"observed_"+kind,label,
+                      effect,clip_text(d["summary"],500),latency,0.93,
+                      safe_json({"interaction_id":cause["id"],"dev_event_id":d["id"],"severity":d["severity"]},16000),now))
 
     with db() as conn:
         conn.execute("DELETE FROM causal_links WHERE source_id=? AND effect_ts>=?",(source_id,cutoff))
@@ -1423,7 +1433,8 @@ def _screenshot_diff(a: sqlite3.Row,b: sqlite3.Row) -> tuple[dict[str,Any], byte
     if not frame_has_image(a) or not frame_has_image(b):
         return {"available":False,"reason":"one_or_both_screenshots_not_retained"},None
     try:
-        ia=Image.open(a["screenshot_path"]).convert("RGB"); ib=Image.open(b["screenshot_path"]).convert("RGB")
+        with Image.open(a["screenshot_path"]) as src_a, Image.open(b["screenshot_path"]) as src_b:
+            ia=src_a.convert("RGB"); ib=src_b.convert("RGB")
         resized=False
         if ib.size != ia.size:
             ib=ib.resize(ia.size); resized=True
@@ -1436,7 +1447,10 @@ def _screenshot_diff(a: sqlite3.Row,b: sqlite3.Row) -> tuple[dict[str,Any], byte
             pad=20; box=(max(0,x1-pad),max(0,y1-pad),min(ia.size[0],x2+pad),min(ia.size[1],y2+pad))
             crop=ImageEnhance.Brightness(diff.crop(box)).enhance(3.0)
             import io as _io
-            bio=_io.BytesIO(); crop.save(bio,format="JPEG",quality=80); return result,bio.getvalue()
+            bio=_io.BytesIO(); crop.save(bio,format="JPEG",quality=80)
+            output=bio.getvalue(); bio.close(); crop.close(); gray.close(); diff.close(); ia.close(); ib.close()
+            return result,output
+        gray.close(); diff.close(); ia.close(); ib.close()
         return result,None
     except Exception as e:
         return {"available":False,"reason":"diff_error","error":str(e)},None
@@ -1506,6 +1520,30 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
             doc_candidates.append((score,b,e))
     doc_bounds=max(doc_candidates,key=lambda x:x[0])[1] if doc_candidates else None
 
+    # Calibrate CSS viewport coordinates to Windows physical screen coordinates.
+    # Chromium reports DOM bounds in CSS pixels while UIA uses physical pixels.
+    dpr=max(0.5,min(float(viewport.get("device_pixel_ratio") or 1.0),4.0))
+    css_w=max(1.0,float(viewport.get("width") or 1)); css_h=max(1.0,float(viewport.get("height") or 1))
+    scale=dpr
+    content_origin=None
+    if doc_bounds:
+        width_scale=float(doc_bounds["width"])/css_w
+        if 0.5 <= width_scale <= 4.0 and abs(width_scale-dpr) <= 0.35:
+            scale=width_scale
+        content_w=css_w*scale; content_h=css_h*scale
+        # Horizontal residual is normally the browser border. Vertical residual is
+        # the title/tab/address toolbar when UIA exposes the whole browser document.
+        content_origin={
+            "x":float(doc_bounds["x"])+max(0.0,(float(doc_bounds["width"])-content_w)/2.0),
+            "y":float(doc_bounds["y"])+max(0.0,float(doc_bounds["height"])-content_h),
+        }
+    elif viewport.get("screen_x") is not None:
+        outer_w=float(viewport.get("outer_width") or css_w); outer_h=float(viewport.get("outer_height") or css_h)
+        content_origin={
+            "x":float(viewport.get("screen_x") or 0)+(outer_w-css_w)/2.0,
+            "y":float(viewport.get("screen_y") or 0)+max(0.0,outer_h-css_h),
+        }
+
     uobjs=[]
     for i,e in enumerate(uels if isinstance(uels,list) else []):
         if not isinstance(e,dict):continue
@@ -1518,9 +1556,12 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
         if not isinstance(e,dict):continue
         role=_norm_role(str(e.get("role") or ""),str(e.get("tag") or "")); name=clip_text(e.get("name") or e.get("value") or "",300); vb=_bounds(e)
         sb=None
-        if vb and doc_bounds:
-            sb={"x":doc_bounds["x"]+vb["x"],"y":doc_bounds["y"]+vb["y"],"width":vb["width"],"height":vb["height"]}
-        dobjs.append({"idx":i,"role":role,"name":name,"norm":_norm_name(name),"viewport_bounds":vb,"screen_bounds_estimate":sb,"raw":e})
+        if vb and content_origin:
+            sb={"x":int(round(content_origin["x"]+vb["x"]*scale)),"y":int(round(content_origin["y"]+vb["y"]*scale)),"width":int(round(vb["width"]*scale)),"height":int(round(vb["height"]*scale))}
+        document_bounds=None
+        if vb:
+            document_bounds={"x":vb["x"]+int(viewport.get("x") or 0),"y":vb["y"]+int(viewport.get("y") or 0),"width":vb["width"],"height":vb["height"]}
+        dobjs.append({"idx":i,"role":role,"name":name,"norm":_norm_name(name),"viewport_bounds":vb,"document_bounds":document_bounds,"screen_bounds_estimate":sb,"raw":e})
 
     by_name={}
     for u in uobjs:
@@ -1529,11 +1570,17 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
     focus_name=_norm_name(str((browser_focus or load_json(row["focus_json"],{})).get("name") or ""))
     for d in dobjs:
         candidates=[u for u in by_name.get(d["norm"],[]) if u["idx"] not in used_u and _role_compatible(d["role"],u["role"])] if d["norm"] else []
+        if not candidates and d["norm"]:
+            candidates=[u for u in uobjs if u["idx"] not in used_u and _role_compatible(d["role"],u["role"]) and u["norm"] and
+                        (u["norm"] in d["norm"] or d["norm"] in u["norm"]) and min(len(u["norm"]),len(d["norm"]))>=3]
         match=None
         if candidates:
             dc=_center(d["screen_bounds_estimate"])
             if dc:
-                match=min(candidates,key=lambda u: (( _center(u["bounds"])[0]-dc[0])**2+( _center(u["bounds"])[1]-dc[1])**2) if _center(u["bounds"]) else 1e18)
+                proposed=min(candidates,key=lambda u: (( _center(u["bounds"])[0]-dc[0])**2+( _center(u["bounds"])[1]-dc[1])**2) if _center(u["bounds"]) else 1e18)
+                pc=_center(proposed["bounds"])
+                if pc and ((pc[0]-dc[0])**2+(pc[1]-dc[1])**2)**0.5 <= max(180,4*max(d["screen_bounds_estimate"]["width"],d["screen_bounds_estimate"]["height"])):
+                    match=proposed
             else:match=candidates[0]
         if match:used_u.add(match["idx"])
         sources=["dom"]+(["uia"] if match else [])
@@ -1541,10 +1588,12 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
         raw=d["raw"]
         object_id="obj_"+sha256_text(f"{row['id']}|{d['role']}|{d['norm']}|{d['idx']}")[:18]
         selector=str(raw.get("selector") or ""); dom_id=str(raw.get("id") or ""); href=str(raw.get("href") or "")
-        stable_key = selector or ("#"+dom_id if dom_id else "") or (href+"|"+d["role"]+"|"+d["norm"]) or (d["role"]+"|"+d["norm"])
+        stable_dom_id = dom_id if dom_id and not dom_id.startswith("radix-") else ""
+        stable_selector = selector if ":nth-of-type" not in selector and "radix-" not in selector else ""
+        stable_key = (href+"|"+d["role"]+"|"+d["norm"]) if href else (("#"+stable_dom_id) if stable_dom_id else (stable_selector or (d["role"]+"|"+d["norm"])))
         stable_id="scene_"+sha256_text(f"{row['source_id']}|dom|{stable_key}")[:20]
         state_hash=sha256_text(json.dumps({"name":d["name"],"value":clip_text(raw.get("value") or "",300),"enabled":not bool(raw.get("disabled")),"focused":bool(focus_name and focus_name==d["norm"]),"bounds":d["viewport_bounds"]},ensure_ascii=False,sort_keys=True))[:16]
-        objects.append({"object_id":object_id,"stable_id":stable_id,"state_hash":state_hash,"role":d["role"],"name":d["name"],"value":clip_text(raw.get("value") or "",300),"sources":sources,"confidence":confidence,"focused":bool(focus_name and focus_name==d["norm"]),"enabled":not bool(raw.get("disabled")),"bounds":{"viewport":d["viewport_bounds"],"screen_estimate":d["screen_bounds_estimate"],"screen":match["bounds"] if match else None},"dom":{"selector":selector,"href":href,"id":dom_id,"tag":raw.get("tag") or ""},"uia":{"automation_id":match["raw"].get("automation_id") if match else "","role":match["role"] if match else ""}})
+        objects.append({"object_id":object_id,"stable_id":stable_id,"state_hash":state_hash,"role":d["role"],"name":d["name"],"value":clip_text(raw.get("value") or "",300),"sources":sources,"confidence":confidence,"focused":bool(focus_name and focus_name==d["norm"]),"enabled":not bool(raw.get("disabled")),"bounds":{"viewport":d["viewport_bounds"],"document":d["document_bounds"],"screen_estimate":d["screen_bounds_estimate"],"screen":match["bounds"] if match else None},"dom":{"selector":selector,"href":href,"id":dom_id,"tag":raw.get("tag") or ""},"uia":{"automation_id":match["raw"].get("automation_id") if match else "","role":match["role"] if match else ""}})
         if len(objects)>=max_objects:break
     if len(objects)<max_objects:
         for u in uobjs:
@@ -1557,7 +1606,7 @@ def build_scene_graph(row: sqlite3.Row, max_objects: int = 200) -> dict[str,Any]
             objects.append({"object_id":object_id,"stable_id":stable_id,"state_hash":state_hash,"role":u["role"],"name":u["name"],"value":clip_text(raw.get("value") or "",300),"sources":["uia"],"confidence":0.84,"focused":bool(focus_name and focus_name==u["norm"]),"enabled":bool(raw.get("enabled",True)),"bounds":{"viewport":None,"screen_estimate":None,"screen":u["bounds"]},"dom":{"selector":"","href":"","id":"","tag":""},"uia":{"automation_id":automation_id,"role":u["role"]}})
             if len(objects)>=max_objects:break
     fused=sum(1 for o in objects if len(o["sources"])>1)
-    return {"frame_id":row["id"],"timestamp":now_iso(float(row["ts"])),"world_state":{"app":row["app"],"window_title":row["window_title"],"url":row["url"],"active_tab":row["active_tab"],"surface":row["surface"],"focus":browser_focus or load_json(row["focus_json"],{}),"cursor":load_json(row["cursor_json"],{}),"viewport":viewport},"source_quality":{"dom_available":bool(dcontrols),"uia_available":bool(uels),"screenshot_available":frame_has_image(row),"browser_bridge_snapshot_id":snapshot_id or None,"document_screen_bounds":doc_bounds},"regions":{"headings":headings[:80] if isinstance(headings,list) else [],"landmarks":landmarks[:60] if isinstance(landmarks,list) else []},"objects":objects,"stats":{"objects":len(objects),"fused_dom_uia":fused,"dom_only":sum(1 for o in objects if o["sources"]==["dom"]),"uia_only":sum(1 for o in objects if o["sources"]==["uia"])}}
+    return {"frame_id":row["id"],"timestamp":now_iso(float(row["ts"])),"world_state":{"app":row["app"],"window_title":row["window_title"],"url":row["url"],"active_tab":row["active_tab"],"surface":row["surface"],"focus":browser_focus or load_json(row["focus_json"],{}),"cursor":load_json(row["cursor_json"],{}),"viewport":viewport},"source_quality":{"dom_available":bool(dcontrols),"uia_available":bool(uels),"screenshot_available":frame_has_image(row),"browser_bridge_snapshot_id":snapshot_id or None,"document_screen_bounds":doc_bounds,"coordinate_calibration":{"scale":round(scale,4),"dpr":dpr,"content_origin":content_origin,"scroll":{"x":viewport.get("x",0),"y":viewport.get("y",0)}}},"regions":{"headings":headings[:80] if isinstance(headings,list) else [],"landmarks":landmarks[:60] if isinstance(landmarks,list) else []},"objects":objects,"stats":{"objects":len(objects),"fused_dom_uia":fused,"dom_only":sum(1 for o in objects if o["sources"]==["dom"]),"uia_only":sum(1 for o in objects if o["sources"]==["uia"])}}
 
 def auth_source(request: Request) -> sqlite3.Row | None:
     auth = request.headers.get("authorization", "")
@@ -1707,6 +1756,26 @@ async def browser_snapshot_ingest(request: Request):
                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (sid,src["id"],ts,t,tab_id,window_id,active,url,title,visible,dom_json,focus_json,viewport_json,semantic_hash,extver,safe_json({"page_visibility":p.get("page_visibility"),"revision":p.get("revision")})))
         conn.execute("UPDATE sources SET last_browser_seen=? WHERE id=?",(t,src["id"]))
+        for idx, raw_input in enumerate((p.get("input_events") or [])[:30]):
+            if not isinstance(raw_input,dict):
+                continue
+            target=raw_input.get("target") if isinstance(raw_input.get("target"),dict) else {}
+            its=float(raw_input.get("timestamp_unix") or ts)
+            if abs(its-t)>120: its=ts
+            kind=clip_text(raw_input.get("kind") or "input",40)
+            iid="inp_"+sha256_text(f"{src['id']}:{its:.4f}:{kind}:{idx}:{target.get('selector','')}")[:24]
+            detail={"button":raw_input.get("button"),"tab_id":tab_id,"window_id":window_id}
+            conn.execute("""INSERT OR IGNORE INTO interaction_events
+              (id,source_id,frame_id,ts,kind,target_role,target_name,selector,key_name,x,y,app,window_title,detail_json,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (iid,src["id"],"",its,kind,clip_text(target.get("role") or "",80),clip_text(target.get("name") or "",300),
+               clip_text(target.get("selector") or "",500),clip_text(raw_input.get("key") or "",40),raw_input.get("x"),raw_input.get("y"),
+               "browser",title,safe_json(detail,4000),t))
+            conn.execute("""INSERT OR IGNORE INTO timeline_events
+              (id,source_id,frame_id,ts,event_type,app,window_title,url,active_tab,detail_json,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+              ("evt_"+iid[4:],src["id"],"",its,"input_"+kind,"browser",title,url,title,
+               safe_json({"target":target,"key":raw_input.get("key") or "","button":raw_input.get("button")},8000),t))
         event_types=[]
         if prev:
             if prev["url"]!=url: event_types.append(("browser_url_changed",{"from":prev["url"],"to":url}))
@@ -1896,8 +1965,10 @@ def dashboard_bundle(source: str | None = None) -> dict[str, Any]:
     with db() as conn:
         latest_episode = conn.execute("SELECT * FROM memory_episodes WHERE source_id=? ORDER BY end_ts DESC LIMIT 1", (src["id"],)).fetchone()
         latest_session = conn.execute("SELECT * FROM memory_sessions WHERE source_id=? ORDER BY end_ts DESC LIMIT 1", (src["id"],)).fetchone()
+        world = state_engine.current(conn, src["id"])
     memory = {
-        "current_activity": latest_episode["title"] if latest_episode else None,
+        "current_activity": world["activity"] if world else None,
+        "world_state": world,
         "latest_episode": _episode_dict(latest_episode) if latest_episode else None,
         "latest_session": _session_dict(latest_session) if latest_session else None,
     }
@@ -2000,12 +2071,10 @@ def _classify_frame_importance(changes: list[Any], events: list[Any], title: str
             if w >= 0.60 and typ not in reasons:
                 reasons.append(typ)
     title_low = (title or "").lower()
-    # Title-level error states are high precision; body text is deliberately not used here
-    # because chats and IME candidate windows routinely contain words like "failed".
-    title_error_terms = ("attention required", "error", "failed", "offline", "exception", "not responding", "错误", "失败", "无响应")
-    if any(x in title_low for x in title_error_terms):
+    # Only OS-level hung-window captions are strong enough without structured events.
+    if "not responding" in title_low or "未响应" in (title or ""):
         score = max(score, 0.97)
-        reasons.append("error_state_title")
+        reasons.append("not_responding")
     if url and any(x in url.lower() for x in ("localhost", "127.0.0.1", "0.0.0.0", "::1")):
         score = max(score, 0.68)
         reasons.append("dev_page")
@@ -2191,6 +2260,9 @@ async def ingest_frame(request: Request):
 
     try:
         with db() as conn:
+            previous_for_state = conn.execute(
+                "SELECT * FROM frames WHERE source_id=? ORDER BY ts DESC LIMIT 1", (src["id"],)
+            ).fetchone()
             conn.execute("""
               INSERT INTO frames(id,source_id,seq,ts,received_at,app,window_title,url,active_tab,focus_json,cursor_json,visual_hash,surface,summary,visible_text,uia_json,dom_json,
                 events_json,changes_json,screenshot_path,screenshot_mime,screenshot_sha256,screenshot_bytes,width,height,semantic_hash,metadata_json,is_keyframe,importance,keyframe_reasons_json,visual_change_json)
@@ -2221,6 +2293,29 @@ async def ingest_frame(request: Request):
                   INSERT INTO timeline_events(id,source_id,frame_id,ts,event_type,app,window_title,url,active_tab,detail_json,created_at)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """, event_items)
+            frame_focus = load_json(focus_json,{})
+            for idx, item in enumerate(events[:50]):
+                if not isinstance(item, dict):
+                    continue
+                kind = clip_text(item.get("kind") or str(item.get("type") or "").removeprefix("input_"), 40)
+                if kind not in {"click","pointer","key","submit"}:
+                    continue
+                target = item.get("target") if isinstance(item.get("target"), dict) else {}
+                try:
+                    its = float(item.get("timestamp_unix") or ts)
+                    if abs(its-t) > 120: its = ts
+                except Exception:
+                    its = ts
+                iid = "inp_"+sha256_text(f"{src['id']}:{frame_id}:{its:.4f}:{kind}:{idx}")[:24]
+                conn.execute("""INSERT OR IGNORE INTO interaction_events
+                  (id,source_id,frame_id,ts,kind,target_role,target_name,selector,key_name,x,y,app,window_title,detail_json,created_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (iid,src["id"],frame_id,its,kind,clip_text(target.get("role") or frame_focus.get("role") or "",80),
+                   clip_text(target.get("name") or frame_focus.get("name") or "",300),clip_text(target.get("selector") or "",500),
+                   clip_text(item.get("key") or "",40),item.get("x"),item.get("y"),app,title,
+                   safe_json({"button":item.get("button"),"observer":"windows"},4000),t))
+            inserted_frame = conn.execute("SELECT * FROM frames WHERE id=?", (frame_id,)).fetchone()
+            incremental = state_engine.advance(conn, inserted_frame, previous_for_state, _human_event)
     except sqlite3.OperationalError as e:
         if screenshot_path:
             _unlink_paths([screenshot_path])
@@ -2248,6 +2343,7 @@ async def ingest_frame(request: Request):
                          "semantic_hash": semantic_hash, "storage_mode": post["mode"],
                          "is_keyframe": bool(is_keyframe), "importance": importance, "keyframe_reasons": keyframe_reasons,
                          "visual_change": visual_change,
+                         "state_engine": incremental,
                          "screenshot_stored": bool(screenshot_path), "screenshot_skip_reason": screenshot_skip_reason})
 
 
@@ -2318,6 +2414,8 @@ def avc_context(source: str | None = None, timeline_seconds: int = 45, timeline_
             "storage": storage_status(),
             "usage_note": "This is a continuous context bundle. Ask for another avc_context only when a newer screen state is needed.",
         }
+        with db() as conn:
+            payload["world_state"] = state_engine.current(conn, src["id"])
         content: list[Any] = [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
         path = frame["screenshot_path"]
         if include_image and path and Path(path).exists():
@@ -2333,7 +2431,10 @@ def avc_current_context(source: str | None = None, text_limit: int = 12000) -> d
     try:
         src = resolve_source(source)
         frame = latest_frame(src["id"])
-        return {"ok": bool(frame), "source": source_dict(src), "current": frame_dict(frame, text_limit, False) if frame else None}
+        with db() as conn:
+            world = state_engine.current(conn, src["id"])
+        return {"ok": bool(frame), "source": source_dict(src), "current": frame_dict(frame, text_limit, False) if frame else None,
+                "world_state": world}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -2545,21 +2646,21 @@ def avc_browser_history(source: str | None = None, seconds: int = 120, limit: in
 
 
 
-@server.tool(description="Return inferred focus-to-UI-change links with approximate latency.", annotations=RO)
+@server.tool(description="Return observer-only input-to-UI-change links with approximate latency. Links require explicit mouse, keyboard, submit or browser navigation evidence.", annotations=RO)
 def avc_causal_timeline(source: str | None = None, seconds: int = 180, limit: int = 80) -> dict[str,Any]:
     try:
-        src=resolve_source(source); seconds=max(1,min(int(seconds),3600)); limit=max(1,min(int(limit),300)); rebuild_causal_links(src["id"],max(1,(seconds+3599)//3600))
+        src=resolve_source(source); seconds=max(1,min(int(seconds),3600)); limit=max(1,min(int(limit),300))
         cutoff=now_ts()-seconds
         with db() as conn: rows=conn.execute("SELECT * FROM causal_links WHERE source_id=? AND effect_ts>=? ORDER BY effect_ts DESC LIMIT ?",(src["id"],cutoff,limit)).fetchall()
         links=[{"causal_id":r["id"],"cause_frame_id":r["cause_frame_id"],"effect_frame_id":r["effect_frame_id"],"cause_time":now_iso(float(r["cause_ts"])),"effect_time":now_iso(float(r["effect_ts"])),"cause_type":r["cause_type"],"cause_label":r["cause_label"],"effect_type":r["effect_type"],"effect_summary":r["effect_summary"],"latency_ms":r["latency_ms"],"confidence":r["confidence"],"detail":load_json(r["detail_json"],{})} for r in reversed(rows)]
-        return {"ok":True,"source":source_dict(src),"links":links,"count":len(links),"note":"These are timing/focus-based causal hints, not proof of a specific input action."}
+        return {"ok":True,"source":source_dict(src),"links":links,"count":len(links),"note":"Observer-only evidence: each hint requires an explicit input event; confidence is not proof of causation."}
     except Exception as e:return {"ok":False,"error":str(e)}
 
 
 @server.tool(description="Return recent automatically detected UI anomalies with severity and source frame.", annotations=RO)
 def avc_anomalies(source: str | None = None, hours: int = 24, severity: str = "", limit: int = 100) -> dict[str,Any]:
     try:
-        src=resolve_source(source); hours=max(1,min(int(hours),72)); limit=max(1,min(int(limit),300)); rebuild_semantic_memory(src["id"],hours)
+        src=resolve_source(source); hours=max(1,min(int(hours),72)); limit=max(1,min(int(limit),300))
         cutoff=now_ts()-hours*3600; sev=severity.strip().lower()
         with db() as conn:
             if sev: rows=conn.execute("SELECT * FROM semantic_events WHERE source_id=? AND ts>=? AND anomaly=1 AND lower(severity)=? ORDER BY ts DESC LIMIT ?",(src["id"],cutoff,sev,limit)).fetchall()
@@ -2675,14 +2776,16 @@ def avc_timepoint(time_value: str, source: str | None = None, before_seconds: in
 @server.tool(description="Build/read AVC semantic memory: Raw Frame -> Semantic Event -> Episode -> Session. Returns compressed human-readable context for recent work.", annotations=RO)
 def avc_memory_context(source: str | None = None, hours: int = 6, episode_limit: int = 30, event_limit: int = 80) -> dict[str,Any]:
     try:
-        src=resolve_source(source); stats=rebuild_semantic_memory(src["id"],hours)
+        src=resolve_source(source)
         cutoff=now_ts()-max(1,min(int(hours),72))*3600
         with db() as conn:
+            engine=conn.execute("SELECT * FROM engine_state WHERE source_id=?",(src["id"],)).fetchone()
             eps=conn.execute("SELECT * FROM memory_episodes WHERE source_id=? AND end_ts>=? ORDER BY start_ts DESC LIMIT ?",(src["id"],cutoff,max(1,min(int(episode_limit),100)))).fetchall()
             ses=conn.execute("SELECT * FROM memory_sessions WHERE source_id=? AND end_ts>=? ORDER BY start_ts DESC LIMIT 20",(src["id"],cutoff)).fetchall()
             evs=conn.execute("SELECT * FROM semantic_events WHERE source_id=? AND ts>=? ORDER BY ts DESC LIMIT ?",(src["id"],cutoff,max(1,min(int(event_limit),300)))).fetchall()
+        stats={"mode":"incremental","engine_version":state_engine.ENGINE_VERSION,"last_frame_id":engine["last_frame_id"] if engine else "","processed_frames":engine["processed_frames"] if engine else 0}
         events=[{"event_id":r["id"],"frame_id":r["frame_id"],"timestamp":now_iso(float(r["ts"])),"type":r["event_type"],"summary":r["summary"],"app":r["app"],"window_title":r["window_title"],"url":r["url"],"confidence":r["confidence"],"anomaly":bool(r["anomaly"]),"severity":r["severity"],"detail":load_json(r["detail_json"],{})} for r in reversed(evs)]
-        return {"ok":True,"source":source_dict(src),"build":stats,"sessions":[_session_dict(x) for x in reversed(ses)],"episodes":[_episode_dict(x) for x in reversed(eps)],"events":events,"usage_note":"Default to sessions/episodes. Drill down to events/frames only when needed."}
+        return {"ok":True,"source":source_dict(src),"build":stats,"sessions":[_session_dict(x) for x in reversed(ses)],"episodes":[_episode_dict(x) for x in reversed(eps)],"events":events,"usage_note":"Read-only incremental memory. Default to sessions/episodes; drill down only when needed."}
     except Exception as e:
         return {"ok":False,"error":str(e)}
 
@@ -2690,13 +2793,45 @@ def avc_memory_context(source: str | None = None, hours: int = 6, episode_limit:
 @server.tool(description="Infer the user's current activity from the newest Episode and recent semantic events. This is lightweight task inference, not an autonomous planner.", annotations=RO)
 def avc_current_activity(source: str | None = None) -> dict[str,Any]:
     try:
-        src=resolve_source(source); rebuild_semantic_memory(src["id"],2)
+        src=resolve_source(source)
         with db() as conn:
+            world=state_engine.current(conn,src["id"])
             ep=conn.execute("SELECT * FROM memory_episodes WHERE source_id=? ORDER BY end_ts DESC LIMIT 1",(src["id"],)).fetchone()
             ev=conn.execute("SELECT * FROM semantic_events WHERE source_id=? ORDER BY ts DESC LIMIT 8",(src["id"],)).fetchall()
-        if not ep:return {"ok":False,"source":source_dict(src),"error":"no recent episode"}
-        age=max(0,now_ts()-float(ep["end_ts"])); confidence=float(ep["confidence"])*(1.0 if age<30 else 0.85 if age<120 else 0.65)
-        return {"ok":True,"source":source_dict(src),"current_activity":ep["title"],"goal_confidence":round(min(0.98,confidence),3),"episode":_episode_dict(ep),"recent_events":[{"timestamp":now_iso(float(x["ts"])),"type":x["event_type"],"summary":x["summary"]} for x in reversed(ev)]}
+        if not world:return {"ok":False,"source":source_dict(src),"error":"no current world state"}
+        age=float(world["age_seconds"]); freshness=1.0 if age<10 else 0.9 if age<30 else 0.7 if age<120 else 0.4
+        confidence=float(world["confidence"])*freshness
+        return {"ok":True,"source":source_dict(src),"current_activity":world["activity"],"goal_confidence":round(min(0.99,confidence),3),"world_state":world,"episode":_episode_dict(ep) if ep else None,"recent_events":[{"timestamp":now_iso(float(x["ts"])),"type":x["event_type"],"summary":x["summary"]} for x in reversed(ev)]}
+    except Exception as e:return {"ok":False,"error":str(e)}
+
+
+@server.tool(description="Return the reliable Current World State maintained incrementally from the latest accepted frame.", annotations=RO)
+def avc_world_state(source: str | None = None) -> dict[str,Any]:
+    try:
+        src=resolve_source(source)
+        with db() as conn:
+            world=state_engine.current(conn,src["id"])
+            engine=conn.execute("SELECT * FROM engine_state WHERE source_id=?",(src["id"],)).fetchone()
+        return {"ok":bool(world),"source":source_dict(src),"world_state":world,
+                "engine":{"version":engine["engine_version"],"processed_frames":engine["processed_frames"],
+                          "last_error":engine["last_error"],"updated_at":now_iso(float(engine["updated_at"]))} if engine else None}
+    except Exception as e:return {"ok":False,"error":str(e)}
+
+
+@server.tool(description="Read visual-memory queue, cache and today's bounded background-processing budget.", annotations=RO)
+def avc_vision_worker_status(source: str | None = None) -> dict[str,Any]:
+    try:
+        src=resolve_source(source) if source else None
+        with db() as conn:
+            if src:
+                pending=conn.execute("SELECT COUNT(*) FROM vision_candidates WHERE source_id=? AND status='pending'",(src["id"],)).fetchone()[0]
+                cached=conn.execute("SELECT COUNT(*) FROM vision_cache WHERE source_id=?",(src["id"],)).fetchone()[0]
+            else:
+                pending=conn.execute("SELECT COUNT(*) FROM vision_candidates WHERE status='pending'").fetchone()[0]
+                cached=conn.execute("SELECT COUNT(*) FROM vision_cache").fetchone()[0]
+            budget=conn.execute("SELECT * FROM vision_budget ORDER BY day DESC LIMIT 1").fetchone()
+        return {"ok":True,"source":source_dict(src) if src else None,"pending":int(pending),"cached":int(cached),
+                "budget":dict(budget) if budget else None}
     except Exception as e:return {"ok":False,"error":str(e)}
 
 

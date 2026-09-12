@@ -1,13 +1,13 @@
-# AImanVisualCopilot (AVC) 0.8.0
+# AImanVisualCopilot (AVC) 0.9.0
 
 AVC is a read-only Visual Context Engine. It observes, understands, compresses and reconstructs Windows/browser context; it deliberately exposes no mouse, keyboard or shell-control MCP tools. Human operation remains primary; AIman can provide optional action capability separately.
 
 ## Architecture
 
 ```text
-Windows Observer 0.2.0                       Chrome / Edge
+Windows Observer 0.3.0                       Chrome / Edge
 UIA + screenshot + focus + cursor                 |
-perceptual dHash + window/text changes       Browser Bridge 0.2.0
+perceptual dHash + input edges               Browser Bridge 0.3.0
              |                               DOM + URL + focus + viewport
              |                               + Dev Observer diagnostics
              +--------------- HTTPS ----------------+
@@ -18,9 +18,9 @@ perceptual dHash + window/text changes       Browser Bridge 0.2.0
                                   |                                     |
                            Semantic Fusion                       Dev Event Ingest
                                   |                                     |
-                           Semantic Frame                         JS/HTTP/network/perf
+                       Incremental State Engine                   JS/HTTP/network/perf
                                   |                                     |
-                           Scene Graph 2.0 <-----------------------------+
+                     Current World State + Scene Graph 2.1 <-------------+
                                   |
               +-------------------+-------------------+
               |                   |                   |
@@ -30,7 +30,7 @@ perceptual dHash + window/text changes       Browser Bridge 0.2.0
               |                   |
         Vision Candidate     Current Activity
               |                   |
-        Vision Cache          Causal Hints / Anomalies
+     Budgeted Worker          Evidence Causality / Anomalies
               +-------------------+
                         |
                     MCP / GPT
@@ -38,15 +38,15 @@ perceptual dHash + window/text changes       Browser Bridge 0.2.0
 
 ## Observation sources
 
-### Windows Observer 0.2.0
-Captures active application/window, bounded UIA structure, visible text, screenshot, focused element, cursor position, perceptual visual hash and typed UI changes. It runs hidden through Task Scheduler and remains independent of terminal windows.
+### Windows Observer 0.3.0
+Captures active application/window, bounded UIA structure, visible text, screenshot, focused element, cursor position, perceptual visual hash, and read-only mouse/key edge events. It never injects input.
 
-### Browser Bridge 0.2.0
-Read-only extension for the real active/focused Chrome/Edge tab. Captures URL, title, visible text, compact DOM controls/headings/landmarks, focus, viewport/scroll state and semantic mutations. Sensitive password/OTP/card-like values are redacted. Browser/Windows fusion requires both temporal proximity and title similarity to avoid cross-profile misfusion.
+### Browser Bridge 0.3.0
+Read-only extension for the real active/focused Chrome/Edge tab. It adds pointer, click, named-key and submit evidence plus DPI, browser-window and scroll geometry. Character values are never recorded; only the label `character` is retained.
 
 ## Dev Observer
 
-For localhost/private-development pages, Browser Bridge 0.2.0 can record:
+For localhost/private-development pages, Browser Bridge can record:
 
 - JavaScript errors and stack summaries
 - unhandled Promise rejections
@@ -59,9 +59,11 @@ For localhost/private-development pages, Browser Bridge 0.2.0 can record:
 
 `avc_dev_context()` reads these diagnostics. Medium/high/critical diagnostics are also promoted into Semantic Memory/Anomalies and can promote the nearest Windows Frame to a 24-hour persistent keyframe.
 
-## Semantic Frame and Scene Graph 2.0
+## Incremental state and Scene Graph 2.1
 
-A Semantic Frame fuses Windows and browser evidence. `avc_scene_graph()` exposes unified UI objects. Every scene object has a per-frame `object_id`, cross-frame `stable_id`, `state_hash`, role/name/value, source confidence, focus/enabled state, DOM selector/href/id, UIA automation id and available viewport/screen bounds. `avc_scene_diff()` compares stable objects across two Frames and returns added/removed/state-changed UI objects.
+Every accepted Frame advances semantic memory once in the same SQLite transaction. Query tools never delete or rebuild history. `current_world_state` is maintained separately from Episodes/Sessions and exposes freshness and evidence quality.
+
+Scene Graph 2.1 calibrates DOM CSS pixels against Windows UIA coordinates using DPR, browser content origin, toolbar residual and scroll offsets. Duplicate names are resolved by compatible role and nearest calibrated position.
 
 ## Memory hierarchy
 
@@ -69,7 +71,7 @@ A Semantic Frame fuses Windows and browser evidence. `avc_scene_graph()` exposes
 Raw Frame -> Semantic Event -> Episode -> Session
 ```
 
-The Timeline Semanticizer runs periodically on USA-Control, reducing raw observation volume into human-readable context. `avc_current_activity()` provides lightweight current-task inference. `avc_causal_timeline()` exposes timing/focus-based causal hints; these are contextual evidence, not proof of a physical click.
+The lightweight semanticizer only catches up a persisted cursor. `avc_world_state()` reads the exact latest state. Causal links require an observed click, pointer, key or submit event followed by a navigation/UI/dev effect; focus proximity alone is not accepted.
 
 ## Visual memory and retention
 
@@ -83,7 +85,7 @@ The Timeline Semanticizer runs periodically on USA-Control, reducing raw observa
 
 Frame importance is scored automatically. Navigation, app/window/tab changes, dialogs, strong visual changes, error states and development diagnostics can promote a Frame to a persistent keyframe. Capacity pressure evicts ordinary/low-importance screenshots before keyframes.
 
-`vision_candidates` is an automatic queue of important Frames that deserve AI interpretation. AVC does not fabricate visual summaries server-side: GPT/model must actually view a retained image and then call `avc_store_vision_cache(...)`; the resulting Vision Cache can survive screenshot expiration.
+`vision_candidates` is consumed every five minutes by a bounded worker. It processes only high-priority frames, deduplicates by screenshot SHA-256, stores short image-backed summaries, and enforces daily and per-run budgets. Vision Cache stays searchable after screenshots expire.
 
 ## Visual retrieval and comparison
 
@@ -102,11 +104,10 @@ Frame importance is scored automatically. Navigation, app/window/tab changes, di
 
 ## MCP
 
-AVC 0.8.0 exposes 32 tools. New 0.8 tools are:
+AVC 0.9.0 adds explicit tools for:
 
-- `avc_dev_context`
-- `avc_vision_candidates`
-- `avc_scene_diff`
+- `avc_world_state`
+- `avc_vision_worker_status`
 
 All 0.7 tools remain compatible.
 
@@ -118,9 +119,9 @@ Dashboard, MCP, Windows source, Browser Bridge and enrollment credentials are se
 
 ## Storage guard
 
-- screenshots: 500 MiB hard cap
-- database: 200 MiB hard cap
-- AVC data directory: 1 GiB cap
+- screenshots: 6 GiB hard cap
+- database: 4 GiB hard cap
+- AVC data directory: 11 GiB cap
 - free disk <20 GiB: semantic-only mode
 - free disk <10 GiB: minimal mode
 
@@ -138,3 +139,8 @@ Under capacity pressure, disposable visual/raw data is removed before durable hi
 - environment: `/etc/aiman-visual-copilot.env`
 - service: `aiman-visual-copilot.service`
 - semanticizer timer: `aiman-visual-copilot-semanticizer.timer`
+- visual-memory timer: `aiman-visual-copilot-vision.timer`
+
+## Database upgrades
+
+Startup runs idempotent migrations. A preflight phase adds legacy columns before creating dependent indexes, preventing the earlier `source_id` migration crash. Applied versions are recorded in `schema_migrations`.

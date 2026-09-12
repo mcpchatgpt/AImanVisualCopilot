@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AImanVisualCopilot Browser Bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Read-only browser semantic and developer-observer bridge for AImanVisualCopilot.",
   "permissions": [
     "tabs",

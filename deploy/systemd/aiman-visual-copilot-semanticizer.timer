@@ -3,7 +3,7 @@ Description=Run AVC Timeline Semanticizer periodically
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=3min
+OnUnitActiveSec=1min
 AccuracySec=20s
 Persistent=true
 Unit=aiman-visual-copilot-semanticizer.service

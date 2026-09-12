@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$AgentVersion = "0.2.0"
+$AgentVersion = "0.3.0"
 $Root = Join-Path $env:ProgramData "AImanVisualCopilot"
 $ConfigPath = Join-Path $Root "config.json"
 $LogPath = Join-Path $Root "observer.log"
@@ -51,6 +51,7 @@ namespace AVC {
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("kernel32.dll")] public static extern bool FreeConsole();
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
@@ -181,6 +182,40 @@ function Get-CursorInfo {
         if ([AVC.Native]::GetCursorPos([ref]$pt)) { return @{ x=[int]$pt.X; y=[int]$pt.Y } }
     } catch {}
     return @{}
+}
+
+function Get-InputEvents([hashtable]$State) {
+    # Read-only polling. The observer records edge transitions and never injects input.
+    $items = New-Object System.Collections.Generic.List[object]
+    $cursor = Get-CursorInfo
+    $keys = @{
+        1=@("click","left"); 2=@("click","right"); 4=@("click","middle")
+        8=@("key","Backspace"); 9=@("key","Tab"); 13=@("key","Enter"); 16=@("key","Shift")
+        17=@("key","Control"); 18=@("key","Alt"); 27=@("key","Escape"); 32=@("key","Space")
+        33=@("key","PageUp"); 34=@("key","PageDown"); 35=@("key","End"); 36=@("key","Home")
+        37=@("key","ArrowLeft"); 38=@("key","ArrowUp"); 39=@("key","ArrowRight"); 40=@("key","ArrowDown")
+        46=@("key","Delete")
+    }
+    foreach ($vk in 1..90) {
+        if (-not $keys.ContainsKey($vk) -and -not (($vk -ge 48 -and $vk -le 57) -or ($vk -ge 65 -and $vk -le 90))) { continue }
+        $raw = [int][AVC.Native]::GetAsyncKeyState($vk)
+        $down = ($raw -band 0x8000) -ne 0
+        $pressed = ($raw -band 0x0001) -ne 0
+        $wasDown = [bool]$State[$vk]
+        if (($pressed -or ($down -and -not $wasDown))) {
+            if ($keys.ContainsKey($vk)) { $kind=[string]$keys[$vk][0]; $name=[string]$keys[$vk][1] }
+            else { $kind="key"; $name="character" }
+            $items.Add(@{
+                type=("input_" + $kind); kind=$kind; key=$(if ($kind -eq "key") { $name } else { "" })
+                button=$(if ($kind -eq "click") { $name } else { "" })
+                x=$(if ($cursor.ContainsKey("x")) { $cursor.x } else { $null })
+                y=$(if ($cursor.ContainsKey("y")) { $cursor.y } else { $null })
+                timestamp_unix=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+            })
+        }
+        $State[$vk] = $down
+    }
+    return @($items)
 }
 
 function Get-ValuePatternText($Element) {
@@ -421,6 +456,7 @@ $lastHeartbeat = Get-Date
 $lastControlPoll = [DateTime]::MinValue
 $monitoringEnabled = $true
 $lastLoggedMonitoring = $null
+$inputState = @{}
 
 while ($true) {
     $controlNow = Get-Date
@@ -459,6 +495,7 @@ while ($true) {
         $focus = if ($uiaCache.focus) { $uiaCache.focus } else { @{} }
         $focusKey = "$($focus.role)|$($focus.name)|$($focus.automation_id)"
         $cursor = Get-CursorInfo
+        $inputEvents = @(Get-InputEvents $inputState)
         $surface = if ($url -or $info.App -in @("chrome","msedge","firefox","brave","opera")) { "browser" } else { "desktop" }
         $textHash = Get-Sha256String $text
         $semantic = Get-Sha256String "$($info.App)`n$($info.Title)`n$url`n$activeTab`n$textHash"
@@ -468,7 +505,7 @@ while ($true) {
         $shotChanged = $shot -and ((-not $previous.visualHash) -or ($visualDistance -ge 3))
         $semanticChanged = $semantic -ne $lastSemantic
         $elapsed = ($now - $lastUpload).TotalSeconds
-        $shouldUpload = $semanticChanged -or $significantVisual -or ($shotChanged -and $elapsed -ge 1.5) -or ($elapsed -ge 5.0)
+        $shouldUpload = ($inputEvents.Count -gt 0) -or $semanticChanged -or $significantVisual -or ($shotChanged -and $elapsed -ge 1.5) -or ($elapsed -ge 5.0)
         if ($shouldUpload) {
             $changes = New-Object System.Collections.Generic.List[object]
             if ($previous.app -and $previous.app -ne $info.App) { $changes.Add(@{ type="app_changed"; from=$previous.app; to=$info.App }) }
@@ -495,7 +532,7 @@ while ($true) {
                 visible_text = $text
                 uia = @{ elements = $uiaCache.elements }
                 dom = @{}
-                events = @()
+                events = $inputEvents
                 changes = $changes
                 metadata = @{ capture="active_window"; observer="uia+screenshot"; pid=$info.Pid; visual_hamming_from_previous=$visualDistance }
             }

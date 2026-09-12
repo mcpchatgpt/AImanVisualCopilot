@@ -1,5 +1,5 @@
 [Unit]
-Description=AImanVisualCopilot Timeline Semanticizer
+Description=AImanVisualCopilot Budgeted Visual Memory Worker
 After=aiman-visual-copilot.service
 
 [Service]
@@ -8,7 +8,7 @@ User=avc
 Group=avc
 WorkingDirectory=/opt/aiman-visual-copilot/app
 EnvironmentFile=/etc/aiman-visual-copilot.env
-ExecStart=/opt/aiman-visual-copilot/venv/bin/python /opt/aiman-visual-copilot/scripts/semanticizer.py
+ExecStart=/opt/aiman-visual-copilot/venv/bin/python /opt/aiman-visual-copilot/scripts/vision_worker.py
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
