@@ -288,7 +288,7 @@ function Get-UiaSnapshot([IntPtr]$Handle, [int]$MaxElements = 220, [int]$MaxDept
                             }
                         } catch {}
                     }
-                    if ($items.Count -lt 180 -and ($name -or $aid -or $type -in @("Button","Edit","TabItem","MenuItem","Hyperlink","Text","ListItem"))) {
+                    if ($items.Count -lt $MaxElements -and ($name -or $aid -or $type -in @("Button","Edit","TabItem","MenuItem","Hyperlink","Text","ListItem"))) {
                         $items.Add([pscustomobject]@{
                             role = $type
                             name = $name
@@ -485,7 +485,7 @@ while ($true) {
         $needUia = (($now - $lastUia).TotalMilliseconds -ge 1800) -or ($info.App -ne $previous.app) -or ($info.Title -ne $previous.title)
         if ($needUia) {
             $isBrowser = $info.App -in @("chrome","msedge","firefox","brave","opera")
-            if ($isBrowser) { $uiaCache = Get-UiaSnapshot $info.Handle 140 4 700 }
+            if ($isBrowser) { $uiaCache = Get-UiaSnapshot $info.Handle 160 5 850 }
             else { $uiaCache = Get-UiaSnapshot $info.Handle 220 5 900 }
             $lastUia = $now
         }
@@ -534,7 +534,7 @@ while ($true) {
                 dom = @{}
                 events = $inputEvents
                 changes = $changes
-                metadata = @{ capture="active_window"; observer="uia+screenshot"; pid=$info.Pid; visual_hamming_from_previous=$visualDistance }
+                metadata = @{ capture="active_window"; observer="uia+screenshot"; pid=$info.Pid; visual_hamming_from_previous=$visualDistance; uia_truncated=[bool]$uiaCache.truncated; uia_elapsed_ms=[int]$uiaCache.elapsed_ms }
             }
             if ($shot) {
                 $body.screenshot_base64 = $shot.Base64

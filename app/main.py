@@ -7,6 +7,7 @@ Windows observer and exposes compact, continuous UI context to AI clients.
 from __future__ import annotations
 
 import base64
+import bisect
 import difflib
 import hashlib
 import io
@@ -1266,9 +1267,12 @@ def rebuild_causal_links(source_id: str, hours: int = 6) -> int:
           ORDER BY ts ASC""",(source_id,cutoff)).fetchall()
         dev_rows=conn.execute("SELECT * FROM dev_events WHERE source_id=? AND ts>=? AND severity IN ('medium','high','critical') ORDER BY ts ASC",(source_id,cutoff)).fetchall()
     links=[]
+    input_times=[float(x["ts"]) for x in inputs]
     def nearest_input(effect_ts: float, max_seconds: float = 5.0):
-        candidates=[i for i in inputs if 0 <= effect_ts-float(i["ts"]) <= max_seconds]
-        return max(candidates,key=lambda x:float(x["ts"])) if candidates else None
+        pos=bisect.bisect_right(input_times,effect_ts)-1
+        if pos < 0 or effect_ts-input_times[pos] > max_seconds:
+            return None
+        return inputs[pos]
     for effect in effects:
         cause=nearest_input(float(effect["ts"]),5.0)
         if not cause: continue
@@ -1748,7 +1752,7 @@ async def browser_snapshot_ingest(request: Request):
       with db() as conn:
         prev=conn.execute("SELECT * FROM browser_snapshots WHERE source_id=? ORDER BY ts DESC LIMIT 1",(src["id"],)).fetchone()
         # Server-side dedup protects against a noisy extension while preserving 10s continuity.
-        if prev and prev["semantic_hash"]==semantic_hash and prev["viewport_json"]==viewport_json and (t-float(prev["received_at"]))<8:
+        if prev and not (p.get("input_events") or []) and prev["semantic_hash"]==semantic_hash and prev["viewport_json"]==viewport_json and (t-float(prev["received_at"]))<8:
             conn.execute("UPDATE sources SET last_browser_seen=? WHERE id=?",(t,src["id"]))
             return JSONResponse({"ok":True,"stored":False,"reason":"dedup","snapshot_id":prev["id"]})
         sid="brs_"+uuid.uuid4().hex[:24]

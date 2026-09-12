@@ -54,11 +54,15 @@ class MigrationTests(unittest.TestCase):
         migrations.apply_migrations(conn)
         self.assertIn("source_id", {r[1] for r in conn.execute("PRAGMA table_info(vision_cache)")})
         self.assertEqual(9, conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
+        conn.close()
 
 
 class StateEngineTests(unittest.TestCase):
     def setUp(self):
         self.conn=connect(); create_state_schema(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
 
     @staticmethod
     def events(row, previous):
@@ -109,6 +113,7 @@ class VisionWorkerTests(unittest.TestCase):
         self.assertEqual(1,result["duplicates"])
         self.assertEqual(2,conn.execute("SELECT COUNT(*) FROM vision_cache").fetchone()[0])
         self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM vision_candidates WHERE status='pending'").fetchone()[0])
+        conn.close()
 
 
 if __name__ == "__main__":
