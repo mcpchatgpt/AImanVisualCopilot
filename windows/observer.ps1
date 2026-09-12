@@ -197,25 +197,25 @@ function Get-InputEvents([hashtable]$State) {
         46=@("key","Delete")
     }
     foreach ($vk in 1..90) {
-        if (-not $keys.ContainsKey($vk) -and -not (($vk -ge 48 -and $vk -le 57) -or ($vk -ge 65 -and $vk -le 90))) { continue }
-        $raw = [int][AVC.Native]::GetAsyncKeyState($vk)
+        [int]$vkCode = [int]$vk
+        if (-not $keys.ContainsKey($vkCode) -and -not (($vkCode -ge 48 -and $vkCode -le 57) -or ($vkCode -ge 65 -and $vkCode -le 90))) { continue }
+        $raw = [int][AVC.Native]::GetAsyncKeyState($vkCode)
         $down = ($raw -band 0x8000) -ne 0
         $pressed = ($raw -band 0x0001) -ne 0
-        $wasDown = [bool]$State[$vk]
+        $wasDown = [bool]$State[$vkCode]
         if (($pressed -or ($down -and -not $wasDown))) {
-            if ($keys.ContainsKey($vk)) { $kind=[string]$keys[$vk][0]; $name=[string]$keys[$vk][1] }
+            if ($keys.ContainsKey($vkCode)) { $kind=[string]$keys[$vkCode][0]; $name=[string]$keys[$vkCode][1] }
             else { $kind="key"; $name="character" }
-            $items.Add(@{
+            $items.Add([pscustomobject]@{
                 type=("input_" + $kind); kind=$kind; key=$(if ($kind -eq "key") { $name } else { "" })
                 button=$(if ($kind -eq "click") { $name } else { "" })
-                x=$(if ($cursor.ContainsKey("x")) { $cursor.x } else { $null })
-                y=$(if ($cursor.ContainsKey("y")) { $cursor.y } else { $null })
+                x=$cursor['x']; y=$cursor['y']
                 timestamp_unix=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
             })
         }
-        $State[$vk] = $down
+        $State[$vkCode] = $down
     }
-    return @($items)
+    return $items.ToArray()
 }
 
 function Get-ValuePatternText($Element) {
@@ -551,7 +551,7 @@ while ($true) {
             }
         }
     } catch {
-        Write-Log "loop error: $($_.Exception.Message)"
+        Write-Log "loop error line=$($_.InvocationInfo.ScriptLineNumber) type=$($_.Exception.GetType().FullName): $($_.Exception.Message)"
     }
     # Heartbeat is deliberately outside the frame-upload try block. A malformed or
     # rejected frame must never make a healthy observer appear offline.
