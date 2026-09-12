@@ -9,7 +9,7 @@ import sqlite3
 import time
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -115,8 +115,22 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
         CREATE INDEX IF NOT EXISTS idx_frames_source_sha ON frames(source_id, screenshot_sha256);
         CREATE INDEX IF NOT EXISTS idx_semantic_frame ON semantic_events(source_id, frame_id);
     """)
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
-        (SCHEMA_VERSION, "incremental-state-world-interactions-vision", time.time()),
-    )
+    # 0.8 causal/anomaly rows were derived from focus proximity and keyword matches.
+    # They cannot be made trustworthy after the fact, so migration 10 discards only
+    # those derived products while preserving raw Frames, Timeline and Dev events.
+    applied = conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)).fetchone()
+    if not applied:
+        tables = _tables(conn)
+        if "causal_links" in tables:
+            conn.execute("DELETE FROM causal_links")
+        if "semantic_events" in tables and {"anomaly","event_type"}.issubset(_columns(conn,"semantic_events")):
+            conn.execute("DELETE FROM semantic_events WHERE anomaly=1 AND event_type='anomaly'")
+        if "memory_episodes" in tables and "anomaly_count" in _columns(conn,"memory_episodes"):
+            conn.execute("UPDATE memory_episodes SET anomaly_count=0")
+        if "memory_sessions" in tables and "anomaly_count" in _columns(conn,"memory_sessions"):
+            conn.execute("UPDATE memory_sessions SET anomaly_count=0")
+        conn.execute(
+            "INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+            (SCHEMA_VERSION, "semantic-trust-reset-and-incremental-state", time.time()),
+        )
     return SCHEMA_VERSION

@@ -53,7 +53,27 @@ class MigrationTests(unittest.TestCase):
         migrations.preflight_legacy_schema(conn)
         migrations.apply_migrations(conn)
         self.assertIn("source_id", {r[1] for r in conn.execute("PRAGMA table_info(vision_cache)")})
-        self.assertEqual(9, conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
+        self.assertEqual(10, conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
+        conn.close()
+
+    def test_semantic_trust_reset_removes_only_untrusted_derivatives(self):
+        conn=connect()
+        conn.executescript("""
+          CREATE TABLE frames(id TEXT,source_id TEXT,received_at REAL,screenshot_sha256 TEXT);
+          CREATE TABLE semantic_events(id TEXT,source_id TEXT,frame_id TEXT,event_type TEXT,anomaly INTEGER);
+          CREATE TABLE causal_links(id TEXT);
+          CREATE TABLE memory_episodes(id TEXT,anomaly_count INTEGER);
+          CREATE TABLE memory_sessions(id TEXT,anomaly_count INTEGER);
+          INSERT INTO semantic_events VALUES('old','s','f','anomaly',1);
+          INSERT INTO semantic_events VALUES('dev','s','f','dev_js_error',1);
+          INSERT INTO causal_links VALUES('focus_guess');
+          INSERT INTO memory_episodes VALUES('e',4);
+          INSERT INTO memory_sessions VALUES('s',4);
+        """)
+        migrations.apply_migrations(conn)
+        self.assertEqual(["dev"],[r[0] for r in conn.execute("SELECT id FROM semantic_events")])
+        self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM causal_links").fetchone()[0])
+        self.assertEqual(0,conn.execute("SELECT anomaly_count FROM memory_episodes").fetchone()[0])
         conn.close()
 
 

@@ -4,6 +4,7 @@
 
 - Replaced query-time semantic rebuilds with transactional incremental state updates.
 - Added reliable `current_world_state`, engine cursors and idempotent database migrations.
+- Reset untrustworthy 0.8 derived anomaly/causality rows during migration while preserving raw observations.
 - Restricted anomaly detection to structured dialogs, OS state, HTTP/network/dev signals and low-information structure.
 - Added DPI/browser-toolbar/scroll coordinate calibration and same-name disambiguation to Scene Graph fusion.
 - Required explicit mouse, key, submit or navigation evidence for causal hints.

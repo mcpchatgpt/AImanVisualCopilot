@@ -143,4 +143,4 @@ Under capacity pressure, disposable visual/raw data is removed before durable hi
 
 ## Database upgrades
 
-Startup runs idempotent migrations. A preflight phase adds legacy columns before creating dependent indexes, preventing the earlier `source_id` migration crash. Applied versions are recorded in `schema_migrations`.
+Startup runs idempotent migrations. A preflight phase adds legacy columns before creating dependent indexes, preventing the earlier `source_id` migration crash. Migration 10 also removes only the untrustworthy 0.8 derived keyword-anomaly and focus-causality rows while preserving raw observations. Applied versions are recorded in `schema_migrations`.
