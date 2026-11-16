@@ -53,13 +53,15 @@ class MigrationTests(unittest.TestCase):
         migrations.preflight_legacy_schema(conn)
         migrations.apply_migrations(conn)
         self.assertIn("source_id", {r[1] for r in conn.execute("PRAGMA table_info(vision_cache)")})
-        self.assertEqual(10, conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
+        self.assertEqual(11, conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0])
         conn.close()
 
     def test_semantic_trust_reset_removes_only_untrusted_derivatives(self):
         conn=connect()
         conn.executescript("""
           CREATE TABLE frames(id TEXT,source_id TEXT,received_at REAL,screenshot_sha256 TEXT);
+          INSERT INTO frames VALUES('raw1','s',1,'a');
+          INSERT INTO frames VALUES('raw2','s',2,'b');
           CREATE TABLE semantic_events(id TEXT,source_id TEXT,frame_id TEXT,event_type TEXT,anomaly INTEGER);
           CREATE TABLE causal_links(id TEXT);
           CREATE TABLE memory_episodes(id TEXT,anomaly_count INTEGER);
@@ -71,9 +73,13 @@ class MigrationTests(unittest.TestCase):
           INSERT INTO memory_sessions VALUES('s',4);
         """)
         migrations.apply_migrations(conn)
-        self.assertEqual(["dev"],[r[0] for r in conn.execute("SELECT id FROM semantic_events")])
+        # v11 deliberately drops the complete *derived* semantic layer because
+        # legacy Episode/Session summaries could still contain untrusted 0.8 text.
+        self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM semantic_events").fetchone()[0])
         self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM causal_links").fetchone()[0])
-        self.assertEqual(0,conn.execute("SELECT anomaly_count FROM memory_episodes").fetchone()[0])
+        self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM memory_episodes").fetchone()[0])
+        self.assertEqual(0,conn.execute("SELECT COUNT(*) FROM memory_sessions").fetchone()[0])
+        self.assertEqual(2,conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0])
         conn.close()
 
 
@@ -100,6 +106,31 @@ class StateEngineTests(unittest.TestCase):
         self.assertEqual("f2",world["frame_id"])
         self.assertEqual("Second",world["activity"])
         self.assertEqual(2,self.conn.execute("SELECT COUNT(*) FROM semantic_events").fetchone()[0])
+
+    def test_reseed_rebuilds_derivatives_without_touching_raw_frames(self):
+        add_frame(self.conn,"r1",100,"First")
+        add_frame(self.conn,"r2",101,"Second")
+        # Simulate legacy derived rows that must not survive the trust reset.
+        self.conn.execute("INSERT INTO semantic_events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          ("legacy","src","r1",99,"anomaly","legacy error","code","Old","",.5,1,"high","{}",99))
+        result=state_engine.reseed_recent(self.conn,"src",self.events,0)
+        self.assertEqual(2,result["processed"])
+        self.assertEqual(2,self.conn.execute("SELECT COUNT(*) FROM frames").fetchone()[0])
+        self.assertEqual(2,self.conn.execute("SELECT COUNT(*) FROM semantic_events").fetchone()[0])
+        self.assertEqual(0,self.conn.execute("SELECT COUNT(*) FROM semantic_events WHERE id='legacy'").fetchone()[0])
+        sessions=self.conn.execute("SELECT COUNT(*) FROM memory_sessions").fetchone()[0]
+        self.assertEqual(1,sessions)
+        self.assertEqual("0.9.1",state_engine.current(self.conn,"src")["engine_version"])
+
+    def test_session_episode_count_is_not_truncated_with_id_window(self):
+        previous=None
+        for i in range(105):
+            row=add_frame(self.conn,f"e{i}",100+i*80,f"Step {i}")
+            state_engine.advance(self.conn,row,previous,self.events)
+            previous=row
+        session=self.conn.execute("SELECT episode_count,episode_ids_json FROM memory_sessions").fetchone()
+        self.assertEqual(105,session["episode_count"])
+        self.assertEqual(100,len(json.loads(session["episode_ids_json"])))
 
     def test_session_counts_every_anomaly_not_only_new_episode(self):
         def anomaly(row, previous):

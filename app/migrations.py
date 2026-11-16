@@ -9,7 +9,7 @@ import sqlite3
 import time
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -25,6 +25,17 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def _add_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
     if table in _tables(conn) and name not in _columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _applied(conn: sqlite3.Connection, version: int) -> bool:
+    return bool(conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone())
+
+
+def _record(conn: sqlite3.Connection, version: int, name: str) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+        (version, name, time.time()),
+    )
 
 
 def preflight_legacy_schema(conn: sqlite3.Connection) -> None:
@@ -60,7 +71,7 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
           current_episode_id TEXT NOT NULL DEFAULT '',
           current_session_id TEXT NOT NULL DEFAULT '',
           processed_frames INTEGER NOT NULL DEFAULT 0,
-          engine_version TEXT NOT NULL DEFAULT '0.9.0',
+          engine_version TEXT NOT NULL DEFAULT '0.9.1',
           last_error TEXT NOT NULL DEFAULT '',
           updated_at REAL NOT NULL
         );
@@ -115,11 +126,10 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
         CREATE INDEX IF NOT EXISTS idx_frames_source_sha ON frames(source_id, screenshot_sha256);
         CREATE INDEX IF NOT EXISTS idx_semantic_frame ON semantic_events(source_id, frame_id);
     """)
-    # 0.8 causal/anomaly rows were derived from focus proximity and keyword matches.
-    # They cannot be made trustworthy after the fact, so migration 10 discards only
-    # those derived products while preserving raw Frames, Timeline and Dev events.
-    applied = conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)).fetchone()
-    if not applied:
+
+    # Migration 10: remove the specific 0.8 products known to be based on keyword
+    # anomaly matching and focus-proximity causality. Raw observations are preserved.
+    if not _applied(conn, 10):
         tables = _tables(conn)
         if "causal_links" in tables:
             conn.execute("DELETE FROM causal_links")
@@ -129,8 +139,22 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
             conn.execute("UPDATE memory_episodes SET anomaly_count=0")
         if "memory_sessions" in tables and "anomaly_count" in _columns(conn,"memory_sessions"):
             conn.execute("UPDATE memory_sessions SET anomaly_count=0")
-        conn.execute(
-            "INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
-            (SCHEMA_VERSION, "semantic-trust-reset-and-incremental-state", time.time()),
-        )
+        _record(conn, 10, "semantic-trust-reset-and-incremental-state")
+
+    # Migration 11: v0.9.0 revealed that legacy Episode/Session summaries themselves
+    # still embedded the old keyword-derived anomaly text and repeated rebuilds had
+    # left overlapping sessions. Those rows are derived data, so discard the complete
+    # semantic derivative layer while preserving Frames, screenshots, DOM/UIA,
+    # Browser snapshots, Timeline, Dev and interaction evidence. The 0.9.1 reseed
+    # utility can deterministically regenerate trusted semantic memory from raw Frames.
+    if not _applied(conn, 11):
+        tables = _tables(conn)
+        for table in (
+            "semantic_events", "causal_links", "memory_episodes", "memory_sessions",
+            "engine_state", "current_world_state",
+        ):
+            if table in tables:
+                conn.execute(f"DELETE FROM {table}")
+        _record(conn, 11, "full-derived-semantic-trust-reset")
+
     return SCHEMA_VERSION

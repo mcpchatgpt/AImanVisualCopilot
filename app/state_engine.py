@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable
 
 
-ENGINE_VERSION = "0.9.0"
+ENGINE_VERSION = "0.9.1"
 
 
 def _json(raw: str | None, default: Any) -> Any:
@@ -132,10 +132,13 @@ def _update_memory(conn: sqlite3.Connection, row: sqlite3.Row, events: list[dict
         episode_ids = _json(last_session["episode_ids_json"], [])
         if episode_id not in episode_ids:
             episode_ids.append(episode_id)
+        # Keep only the newest 100 IDs for compact drill-down, but episode_count is
+        # the true cumulative count and must not be truncated with the ID window.
+        episode_count = int(last_session["episode_count"]) + (1 if created_episode else 0)
         conn.execute("""UPDATE memory_sessions SET end_ts=?,title=?,summary=?,episode_ids_json=?,episode_count=?,
           anomaly_count=anomaly_count+?,updated_at=? WHERE id=?""",
           (ts, activity, _append_summary(last_session["summary"], summary, 5), _dump(episode_ids[-100:]),
-           len(episode_ids[-100:]), anomaly_count, now, session_id))
+           episode_count, anomaly_count, now, session_id))
     else:
         session_id = _id("ses_", f"{source_id}:{episode_id}")
         conn.execute("""INSERT OR IGNORE INTO memory_sessions
@@ -174,6 +177,43 @@ def initialize_latest(conn: sqlite3.Connection, source_id: str) -> bool:
                      (source_id,row["id"],float(row["ts"]),ep[0] if ep else "",ses[0] if ses else "",ENGINE_VERSION,time.time()))
     return True
 
+
+
+def reseed_recent(conn: sqlite3.Connection, source_id: str,
+                  event_builder: Callable[[sqlite3.Row, sqlite3.Row | None], list[dict[str, Any]]],
+                  since_ts: float = 0.0) -> dict[str, Any]:
+    """Rebuild only derived semantic state for one source from trusted raw Frames.
+
+    This is an explicit maintenance operation used after a trust-boundary migration.
+    Raw Frames and evidence tables are never modified. Normal query paths never call it.
+    """
+    tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table in ("semantic_events", "memory_episodes", "memory_sessions", "engine_state", "current_world_state"):
+        if table in tables:
+            conn.execute(f"DELETE FROM {table} WHERE source_id=?", (source_id,))
+    if "causal_links" in tables:
+        conn.execute("DELETE FROM causal_links WHERE source_id=?", (source_id,))
+
+    rows = conn.execute(
+        "SELECT * FROM frames WHERE source_id=? AND ts>=? ORDER BY ts ASC,id ASC",
+        (source_id, float(since_ts)),
+    ).fetchall()
+    if not rows:
+        initialized = initialize_latest(conn, source_id)
+        return {"processed": 0, "initialized": initialized, "events": 0}
+
+    first = rows[0]
+    previous = conn.execute(
+        """SELECT * FROM frames WHERE source_id=? AND
+        (ts<? OR (ts=? AND id<?)) ORDER BY ts DESC,id DESC LIMIT 1""",
+        (source_id, float(first["ts"]), float(first["ts"]), str(first["id"])),
+    ).fetchone()
+    event_count = 0
+    for row in rows:
+        result = advance(conn, row, previous, event_builder)
+        event_count += int(result.get("events") or 0)
+        previous = row
+    return {"processed": len(rows), "initialized": False, "events": event_count}
 
 def current(conn: sqlite3.Connection, source_id: str) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM current_world_state WHERE source_id=?", (source_id,)).fetchone()

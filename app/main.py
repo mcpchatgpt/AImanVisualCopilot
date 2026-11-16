@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AImanVisualCopilot (AVC) v0.9.0.
+"""AImanVisualCopilot (AVC) v0.9.1.
 
 A read-only MCP observation layer for Windows. AVC ingests semantic frames from a
 Windows observer and exposes compact, continuous UI context to AI clients.
@@ -37,7 +37,7 @@ from starlette.routing import Route
 import migrations
 import state_engine
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 SERVICE = "AImanVisualCopilot"
 MCP_TOKEN = os.environ.get("AVC_MCP_TOKEN", "")
 BOOTSTRAP_TOKEN = os.environ.get("AVC_BOOTSTRAP_TOKEN", "")

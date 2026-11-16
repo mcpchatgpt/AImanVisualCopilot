@@ -1,4 +1,4 @@
-# AImanVisualCopilot (AVC) 0.9.0
+# AImanVisualCopilot (AVC) 0.9.1
 
 AVC is a read-only Visual Context Engine. It observes, understands, compresses and reconstructs Windows/browser context; it deliberately exposes no mouse, keyboard or shell-control MCP tools. Human operation remains primary; AIman can provide optional action capability separately.
 
@@ -143,4 +143,4 @@ Under capacity pressure, disposable visual/raw data is removed before durable hi
 
 ## Database upgrades
 
-Startup runs idempotent migrations. A preflight phase adds legacy columns before creating dependent indexes, preventing the earlier `source_id` migration crash. Migration 10 also removes only the untrustworthy 0.8 derived keyword-anomaly and focus-causality rows while preserving raw observations. Applied versions are recorded in `schema_migrations`.
+Startup runs idempotent migrations. A preflight phase adds legacy columns before creating dependent indexes, preventing the earlier `source_id` migration crash. Migration 10 removes the known 0.8 keyword-anomaly/focus-causality products. Migration 11 completes the trust reset by dropping stale derived Semantic Event/Episode/Session/causal rows whose summaries could still embed 0.8 assumptions, while preserving raw Frames, screenshots, DOM/UIA, Timeline, Dev and interaction evidence. `scripts/semanticizer.py --reseed` deterministically rebuilds trusted memory from retained raw Frames. Applied versions are recorded in `schema_migrations`.

@@ -1,3 +1,11 @@
+## 0.9.1
+
+- Added Migration 11 to complete the semantic trust reset while preserving raw observation/evidence.
+- Added deterministic `semanticizer.py --reseed` recovery from retained raw Frames.
+- Removed overlapping legacy Sessions and embedded keyword-anomaly summaries after reseed.
+- Fixed Session Episode counts beyond the 100-ID drill-down window.
+- Added production-copy migration/reseed regression coverage and an explicit reseed unit test.
+
 # Changelog
 
 ## 0.9.0
